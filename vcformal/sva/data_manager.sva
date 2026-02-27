@@ -1,0 +1,186 @@
+
+module data_manager_sva
+  #(parameter DEPTH      = 48, 
+    parameter DATA_WIDTH = 32 
+)
+   (
+    input  logic                    clk,
+    input  logic                    reset,
+
+    // Valid/Ready Handshake & Data Out
+    input  logic                    valid_o,
+    input  logic                    ready_i,
+    input  logic [DATA_WIDTH-1:0]   data_o,
+    input  logic [$clog2(DEPTH)-1:0] data_id,
+
+    // Abort/Retire interface
+    input  logic                    abort_vld,
+    input  logic [$clog2(DEPTH)-1:0] abort_id,
+    input  logic [$clog2(DEPTH)-1:0] retire_ptr,
+    input  logic [DATA_WIDTH-1:0]   abort_data,
+
+    input logic [$clog2(DEPTH+1)-1:0] outstanding_cnt
+    );
+
+  // Default clocking block
+  default clocking @(posedge clk); endclocking
+  // Default disable iff
+  default disable iff (reset);
+
+    // 2. The module has the following outputs/inputs
+    // a. A valid/ready handshake protocol (valid_o & ready_i)
+    // b. A data port that sends 32 bits of data when the handshake is valid (data_o). It
+    // follows all the rules of a ready/valid protocol
+    // c. Each data is associated with a unique ID (data_id). The Id can range from 0 to 47
+    // and can also wrap around. ID must be incremented by 1 between each
+    // transaction strating from 0.
+    // d. These are the inputs coming to the design, namely, abort_vld, abort_id, retire_ptr,
+    // abort_data(32_bit)
+    // 3. When data is sent out using data_o with specifit id, it will either be retired or aborted by
+    // the other module. Between these events, the data is considered 'outstanding' and will be
+    // stored in an internal buffer unless aborted or retired
+    // 4. If a data ID is outstanding, it cannot be replayed until it is either retired or aborted
+    // 5. The internal buffer, when empty, represents no outstanding data. Similarly, full means 48
+    // outstanding data elements are waiting for abort or retirement
+    // 6. When the abort is valid, the design will discard all the buffer entries younger than the
+    // abort id and start sending the data again from the abort_id
+    // 7. When the retire_ptr increments (input of the design), the design will discard the entries
+    // and flag them as retired. E.g, if the retire_ptr jumps from 0x00 to 0x05, it means that the
+    // IDs 0x00 to 0x04 are retired.
+    // 8. The design can reuse the aborted or retired ids. But must increase by 1 from the current
+    // ID
+    // 9. The retire_ptr can jup upto 6 places. If it reaches the limit (47), it wraps around to 0
+    // 10. Only the outstanding data entries can be aborted or retired.
+    // 11. We can have aborts coming to the design even when there are no outstanding data, but
+    // in this case, the abort id will be the same as the current retire pointer.
+    
+    // --------------------------------
+    // Aux Code
+    // --------------------------------
+    logic [DEPTH-1:0] out_q;
+    logic [$clog2(DEPTH)-1:0]  retire_ptr_q;
+    logic data_hsk;
+    logic [$clog2(DEPTH)-1:0] min_ptr, max_ptr, next_min_ptr, next_max_ptr;
+    logic abort_id_in_range, next_abort_id_in_range;
+    logic [$clog2(DEPTH+1)-1:0] retire_jump;
+    logic [DATA_WIDTH-1:0] sent_data [DEPTH-1:0];
+
+    assign data_hsk = valid_o && ready_i;
+    
+    always_ff @(posedge clk) begin
+        if (data_hsk && !abort_vld) begin
+            sent_data[data_id] <= data_o;
+        end
+    end
+
+    always_ff @(posedge clk or posedge reset) begin
+    if (reset) begin
+        out_q          <= '0;
+        retire_ptr_q <= '0;
+    end else begin
+        retire_ptr_q <= retire_ptr;
+        // Handles point 7 of spec.
+        if (retire_ptr != retire_ptr_q) begin
+            for (int k = 0; k < DEPTH; k++) begin
+                if ( (retire_ptr_q <= retire_ptr && (k >= retire_ptr_q) && (k < retire_ptr)) ||
+                    (retire_ptr_q >  retire_ptr && ((k >= retire_ptr_q) || (k < retire_ptr))) )
+                    out_q[k] <= 1'b0;
+            end
+        end
+
+        // abort clear younger
+        if (abort_vld) begin
+            for (int k = 0; k < DEPTH; k++) begin
+                if ( (abort_id <= data_id && (k > retire_ptr_q) && (k <= data_id)) ||
+                    (abort_id >  data_id && ((abort_id > retire_ptr_q) || (k <= data_id))) )
+                    out_q[k] <= 1'b0;
+            end
+        end
+
+        // mark outstanding
+        if (data_hsk && !abort_vld) begin
+            out_q[data_id] <= 1'b1;
+        end
+    end
+    end
+
+    assign retire_jump = (retire_ptr > retire_ptr_q ) ? (retire_ptr - retire_ptr_q) : (DEPTH - retire_ptr_q + retire_ptr);
+
+    always_comb begin
+        next_min_ptr = retire_ptr;
+        next_max_ptr = max_ptr;
+        next_abort_id_in_range = abort_id_in_range;
+
+        if (abort_vld) begin
+            if (min_ptr == max_ptr) begin
+                // empty case
+                next_abort_id_in_range = (abort_id == min_ptr);
+                next_max_ptr = abort_id;
+            end else if (min_ptr < max_ptr) begin
+                // non-wrap case
+                next_abort_id_in_range = (abort_id > min_ptr) && (abort_id <= max_ptr);
+                next_max_ptr = abort_id;
+            end else if ((min_ptr > max_ptr) && (min_ptr - max_ptr == outstanding_cnt)) begin
+                // wrap case
+                next_abort_id_in_range = (abort_id > min_ptr) || (abort_id <= max_ptr);
+                next_max_ptr = abort_id;
+            end
+        end
+        else if (data_hsk) begin
+            next_max_ptr = data_id;
+        end
+        else begin
+            next_abort_id_in_range = 0;
+        end
+    end
+
+    always_ff @(posedge clk or posedge reset) begin
+        if (reset) begin
+            min_ptr <= 0;
+            max_ptr <= 0;
+            abort_id_in_range <= 0;
+        end
+        else begin
+            min_ptr <= next_min_ptr;
+            max_ptr <= next_max_ptr;
+            abort_id_in_range <= next_abort_id_in_range;
+        end
+    end
+
+    // --------------------------------
+    // Assumptions
+    // --------------------------------
+    // Stability
+    asm_ready_i_stable: assume property (valid_o && !ready_i |=> !$isunknown($past(ready_i)));
+    asm_no_abort_when_no_ready: assume property (valid_o && !ready_i |=> !abort_vld);
+    asm_retire_ptr_bound: assume property (retire_ptr < DEPTH && retire_ptr >= 0);
+    asm_abort_id_bound: assume property (abort_id < DEPTH && abort_id >= 0);
+
+    asm_retire_ptr_jump: assume property ((retire_ptr != retire_ptr_q) |-> (retire_jump <= 6) );
+    asm_retire_ptr_range: assume property ((retire_ptr != retire_ptr_q) |-> (outstanding_cnt > 0) && (retire_jump <= outstanding_cnt));
+    asm_abort_id_when_empty: assume property (abort_vld && (outstanding_cnt == 0) |-> (abort_id == retire_ptr));
+    asm_abort_id_valid_range: assume property ( abort_vld |-> next_abort_id_in_range );
+    asm_abort_data_matches_sent: assume property (abort_vld && out_q[abort_id] |-> (abort_data == sent_data[abort_id]));
+
+
+
+    // --------------------------------
+    // Assertions
+    // --------------------------------
+
+    ast_stable_when_not_ready: assert property ( valid_o && !ready_i && !abort_vld |=> valid_o && ($stable(data_o) && $stable(data_id)));
+    ast_id_increment: assert property (data_hsk && !abort_vld |=> (data_id == (($past(data_id)==DEPTH-1) ? '0 : $past(data_id)+1)));
+    ast_full_depth_outstanding: assert property ((outstanding_cnt == DEPTH) |=> !valid_o);
+    ast_no_replay_outstanding: assert property (data_hsk |-> !out_q[data_id]);
+    ast_abort_on_outstanding: assert property (abort_vld |-> out_q[abort_id] || (abort_id == retire_ptr));
+    ast_abort_update_data_id: assert property (abort_vld |=> (data_id == abort_id));
+
+
+
+    // --------------------------------
+    // Covers
+    // --------------------------------
+    cover_data_ids_wrap: cover property (data_id == 0 ##(DEPTH-1) data_id == DEPTH-1 ##1 data_id == 0);
+
+
+endmodule

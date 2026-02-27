@@ -1,0 +1,1 @@
+bind data_manager data_manager_sva # (.DEPTH(DEPTH), .DATA_WIDTH(DATA_WIDTH)) u_data_manager_sva (.*);
