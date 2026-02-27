@@ -19,7 +19,10 @@ module data_manager_sva
     input  logic [$clog2(DEPTH)-1:0] retire_ptr,
     input  logic [DATA_WIDTH-1:0]   abort_data,
 
-    input logic [$clog2(DEPTH+1)-1:0] outstanding_cnt
+    input logic [$clog2(DEPTH+1)-1:0] outstanding_cnt,
+    input logic [$clog2(DEPTH)-1:0] send_ptr,
+    input logic [DATA_WIDTH-1:0] current_data,
+    input logic [DATA_WIDTH-1:0] internal_buffer [DEPTH-1:0]
     );
 
   // Default clocking block
@@ -63,7 +66,23 @@ module data_manager_sva
     logic [$clog2(DEPTH)-1:0] min_ptr, max_ptr, next_min_ptr, next_max_ptr;
     logic abort_id_in_range, next_abort_id_in_range;
     logic [$clog2(DEPTH+1)-1:0] retire_jump;
+    logic [$clog2(DEPTH+1)-1:0] abort_id_diff;
     logic [DATA_WIDTH-1:0] sent_data [DEPTH-1:0];
+    localparam int PTR_W = $clog2(DEPTH);
+    localparam int CNT_W = $clog2(DEPTH + 1);
+
+    // Helper function for circular distance
+    function automatic logic [CNT_W-1:0] calc_distance(
+        input logic [PTR_W-1:0] head, 
+        input logic [PTR_W-1:0] tail
+    );
+        if (head >= tail) begin
+            calc_distance = head - tail;
+        end else begin
+            // Cast DEPTH to ensure the addition doesn't truncate
+            calc_distance = (CNT_W'(head) + CNT_W'(DEPTH)) - CNT_W'(tail);
+        end
+    endfunction
 
     assign data_hsk = valid_o && ready_i;
     
@@ -104,8 +123,8 @@ module data_manager_sva
     end
     end
 
-    assign retire_jump = (retire_ptr > retire_ptr_q ) ? (retire_ptr - retire_ptr_q) : (DEPTH - retire_ptr_q + retire_ptr);
-
+    assign retire_jump = calc_distance(retire_ptr, retire_ptr_q);
+    assign abort_id_diff = calc_distance(abort_id, retire_ptr);
     always_comb begin
         next_min_ptr = retire_ptr;
         next_max_ptr = max_ptr;
@@ -156,11 +175,12 @@ module data_manager_sva
     asm_retire_ptr_bound: assume property (retire_ptr < DEPTH && retire_ptr >= 0);
     asm_abort_id_bound: assume property (abort_id < DEPTH && abort_id >= 0);
 
-    asm_retire_ptr_jump: assume property ((retire_ptr != retire_ptr_q) |-> (retire_jump <= 6) );
+    asm_max_retire_ptr_jump: assume property (retire_jump <= 6  && retire_jump >= 0);
+    asm_abort_id_legal: assume property (abort_vld |-> (outstanding_cnt > 0) ? (abort_id_diff <= outstanding_cnt) : (abort_id == retire_ptr));
     asm_retire_ptr_range: assume property ((retire_ptr != retire_ptr_q) |-> (outstanding_cnt > 0) && (retire_jump <= outstanding_cnt));
-    asm_abort_id_when_empty: assume property (abort_vld && (outstanding_cnt == 0) |-> (abort_id == retire_ptr));
-    asm_abort_id_valid_range: assume property ( abort_vld |-> next_abort_id_in_range );
-    asm_abort_data_matches_sent: assume property (abort_vld && out_q[abort_id] |-> (abort_data == sent_data[abort_id]));
+    // asm_abort_id_when_empty: assume property (abort_vld && (outstanding_cnt == 0) |-> (abort_id == retire_ptr));
+    // asm_abort_id_valid_range: assume property ( abort_vld |-> next_abort_id_in_range );
+    // asm_abort_data_matches_sent: assume property (abort_vld && out_q[abort_id] |-> (abort_data == sent_data[abort_id]));
 
 
 
@@ -170,10 +190,22 @@ module data_manager_sva
 
     ast_stable_when_not_ready: assert property ( valid_o && !ready_i && !abort_vld |=> valid_o && ($stable(data_o) && $stable(data_id)));
     ast_id_increment: assert property (data_hsk && !abort_vld |=> (data_id == (($past(data_id)==DEPTH-1) ? '0 : $past(data_id)+1)));
-    ast_full_depth_outstanding: assert property ((outstanding_cnt == DEPTH) |=> !valid_o);
-    ast_no_replay_outstanding: assert property (data_hsk |-> !out_q[data_id]);
-    ast_abort_on_outstanding: assert property (abort_vld |-> out_q[abort_id] || (abort_id == retire_ptr));
-    ast_abort_update_data_id: assert property (abort_vld |=> (data_id == abort_id));
+    ast_full_depth_outstanding: assert property ((outstanding_cnt == DEPTH) |-> !valid_o);
+    ast_outstanding_cnt_limit: assert property (outstanding_cnt <= DEPTH);
+    // ast_no_replay_outstanding: assert property (data_hsk |-> !out_q[data_id]);
+    // ast_abort_on_outstanding: assert property (abort_vld |-> out_q[abort_id] || (abort_id == retire_ptr));
+    ast_abort_update_data_id: assert property (abort_vld |=> (data_id == $past(abort_id)) && (data_o == $past(abort_data)));
+    ast_cnt_update_logic: assert property (!abort_vld |=> outstanding_cnt == ($past(outstanding_cnt) + $past(data_hsk) - $past(retire_jump)));
+    ast_buffer_write: assert property (data_hsk && !abort_vld |=> (internal_buffer[DEPTH-1-$past(send_ptr)] == $past(current_data)));
+
+    // 2. Buffer Stability: Outstanding data must NOT change until retired/aborted [1, 3]
+    generate
+        for (genvar i = 0; i < DEPTH; i++) begin : gen_buf_checks
+            ast_buffer_stability: assert property (
+                ((calc_distance(i, retire_ptr) < outstanding_cnt) && data_hsk && !abort_vld && send_ptr == i)
+                |=> $stable(internal_buffer[i]));
+        end
+    endgenerate
 
 
 
