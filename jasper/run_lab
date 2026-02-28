@@ -1,0 +1,1 @@
+make DUT_TOP=data_manager FPV_PATH=`pwd` $1
